@@ -1,0 +1,9 @@
+{
+  "name": "@signalpipe/shared",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "dependencies": { "kafkajs": "^2.2.4", "pg": "^8.13.0", "ioredis": "^5.4.1" },
+  "devDependencies": { "@types/pg": "^8.11.0" }
+}

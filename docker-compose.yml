@@ -1,0 +1,78 @@
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda start
+      - --overprovisioned
+      - --smp 1
+      - --memory 512M
+      - --reserve-memory 0M
+      - --node-id 0
+      - --check=false
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: signalpipe
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ingester:
+    build: .
+    command: ["node", "services/ingester/dist/main.js"]
+    environment:
+      REDPANDA_BROKERS: redpanda:9092
+      POLL_SECONDS: "300"
+      # Default to the fixture so `docker compose up` works with no network.
+      # Unset it to poll the live OSV API.
+      OFFLINE_FIXTURE: /app/ops/fixture.json
+    volumes:
+      - ./ops/fixture.json:/app/ops/fixture.json:ro
+    depends_on:
+      redpanda: { condition: service_healthy }
+
+  processor:
+    build: .
+    command: ["node", "services/processor/dist/main.js"]
+    environment:
+      REDPANDA_BROKERS: redpanda:9092
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/signalpipe
+      REDIS_URL: redis://redis:6379
+      MAX_ATTEMPTS: "3"
+      # Set ANTHROPIC_API_KEY to swap the heuristic extractor for Claude.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      redpanda: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  api:
+    build: .
+    command: ["node", "services/api/dist/main.js"]
+    # Override with API_PORT if 3900 is taken on your machine.
+    ports: ["${API_PORT:-3900}:3000"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/signalpipe
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }

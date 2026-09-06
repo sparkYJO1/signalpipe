@@ -1,0 +1,6 @@
+{
+  "name": "@signalpipe/processor",
+  "version": "0.1.0",
+  "scripts": { "build": "tsc -p tsconfig.json", "start": "node dist/main.js" },
+  "dependencies": { "@signalpipe/shared": "*", "kafkajs": "^2.2.4", "pg": "^8.13.0", "ioredis": "^5.4.1" }
+}

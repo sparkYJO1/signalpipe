@@ -1,0 +1,6 @@
+{
+  "name": "@signalpipe/ingester",
+  "version": "0.1.0",
+  "scripts": { "build": "tsc -p tsconfig.json", "start": "node dist/main.js" },
+  "dependencies": { "@signalpipe/shared": "*", "kafkajs": "^2.2.4" }
+}
