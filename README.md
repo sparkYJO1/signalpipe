@@ -1,5 +1,7 @@
 # signalpipe
 
+[![release probe](https://github.com/sparkYJO1/signalpipe/actions/workflows/release-probe.yml/badge.svg)](https://github.com/sparkYJO1/signalpipe/actions/workflows/release-probe.yml)
+
 An ingest pipeline with a **slow, expensive, non-deterministic consumer** in the
 middle of it.
 
@@ -80,8 +82,9 @@ failures: none — 0 non-2xx, 0 connection errors, 0 timeouts
 Six runs of this configuration, 10,449 requests at 40–50/s, zero failures — two
 of them the first probe against a cluster that was minutes old. That table is what the word zero-downtime is allowed to mean in this
 repository: a measurement with a scope attached, not an adjective. The same
-probe runs in CI against a k3d cluster on every push, so the number fails the
-build when it stops being true rather than ageing quietly in a README.
+probe runs in CI against a k3d cluster on every push — that is what the badge at
+the top is — so the number fails the build when it stops being true rather than
+ageing quietly in a README.
 
 Getting there took three attempts at the shutdown path, and two more at the
 startup path. The configuration most guides describe — `maxUnavailable: 0` and
