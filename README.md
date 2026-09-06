@@ -69,6 +69,13 @@ parts where a different engineer could reasonably have chosen otherwise.
 [`docs/plan.md`](docs/plan.md) is the plan this was built from, including what
 was deliberately cut.
 
+## Extracted from this
+
+**[nestjs-outbox](https://github.com/sparkYJO1/nestjs-outbox)** — the
+transactional outbox and idempotent-consumer parts, pulled out as a package.
+The API is shaped the way it is because it came out of building this, not from
+designing a library in the abstract.
+
 ## Deliberately not here
 
 Kubernetes and Helm. Zero-downtime deploy verification. Multi-tenancy. Auth. A
