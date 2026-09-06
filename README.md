@@ -16,6 +16,10 @@ docker compose up --build     # no API key needed
 curl localhost:3900/health
 ```
 
+There is a second path — a Helm chart, a k3d cluster and a script that measures
+what a release costs. It is below, under
+[Releases are measured](#releases-are-measured).
+
 ## What it does
 
 ```
@@ -53,6 +57,58 @@ Set `ANTHROPIC_API_KEY` and the same interface swaps to Claude. The heuristic
 then becomes the baseline the model is measured against, which is more useful
 than either alone.
 
+## Releases are measured
+
+`./deploy/probe.sh` fires steady open-loop traffic at `POST /check` while a real
+`helm upgrade` rolls the API underneath it, and **exits non-zero if a single
+request failed**. Real output from `./deploy/k3d-up.sh && ./deploy/probe.sh` on
+a cluster created two minutes earlier — three replicas, 50 requests per second,
+through a Traefik ingress:
+
+```
+window          requests  failed     p50     p95     p99     max
+---------------------------------------------------------
+before deploy        239       0     4ms    12ms    33ms    42ms
+during deploy        546       0     6ms   121ms   350ms   551ms
+after deploy         957       0     4ms    12ms   107ms   327ms
+total               1742       0     4ms    21ms   221ms   551ms
+
+helm upgrade + rollout: 11.4s   exit=0   offered load 50/s
+failures: none — 0 non-2xx, 0 connection errors, 0 timeouts
+```
+
+Six runs of this configuration, 10,449 requests at 40–50/s, zero failures — two
+of them the first probe against a cluster that was minutes old. That table is what the word zero-downtime is allowed to mean in this
+repository: a measurement with a scope attached, not an adjective. The same
+probe runs in CI against a k3d cluster on every push, so the number fails the
+build when it stops being true rather than ageing quietly in a README.
+
+Getting there took three attempts at the shutdown path, and two more at the
+startup path. The configuration most guides describe — `maxUnavailable: 0` and
+a readiness probe that fails on SIGTERM — dropped 49 of 1652 requests. The one
+after that reached zero failures with a `p99` of 2.7 seconds, which counting
+only failures would have called a success.
+[ADR-0006](docs/decisions/0006-a-pod-drains-itself.md) has every failing run
+with its numbers and the commands to reproduce them.
+
+**What this does not prove.** A k3d cluster is two nodes on one laptop behind
+Traefik. It is not a production cluster behind a cloud load balancer, which
+notices an unhealthy target more slowly than Traefik does and would need a
+longer drain window, not a shorter one. 50 requests per second is low enough
+that three replicas minus one is still ample, so this measures the routing gap
+during a rollout and not capacity under one. The in-cluster Postgres, Redis and
+Redpanda are single replicas on `emptyDir`. What it does prove is that the
+shutdown path is correct and stays correct, which is the part that is usually
+wrong.
+
+[`deploy/README.md`](deploy/README.md) is the short version:
+
+```bash
+./deploy/k3d-up.sh     # cluster + image + helm install
+./deploy/probe.sh      # the table above
+./deploy/k3d-down.sh
+```
+
 ## The decisions worth arguing about
 
 Each of these is a page in [`docs/decisions/`](docs/decisions/). They are the
@@ -65,6 +121,7 @@ parts where a different engineer could reasonably have chosen otherwise.
 | [ADR-0003](docs/decisions/0003-postgres-is-the-truth-redis-is-a-copy.md) | Losing Redis costs money and latency, never correctness |
 | [ADR-0004](docs/decisions/0004-partition-by-package-not-by-advisory.md) | Partitioning by package accepts a hot-partition risk to keep per-package ordering |
 | [ADR-0005](docs/decisions/0005-retry-in-band-then-park.md) | Retries re-publish with a counter instead of throwing, so one bad message cannot stall a partition |
+| [ADR-0006](docs/decisions/0006-a-pod-drains-itself.md) | A pod drains itself. Readiness is a request to stop sending, not an acknowledgement that sending has stopped — with the two configurations that did not work |
 
 [`docs/plan.md`](docs/plan.md) is the plan this was built from, including what
 was deliberately cut.
@@ -78,13 +135,13 @@ designing a library in the abstract.
 
 ## Deliberately not here
 
-Kubernetes and Helm. Zero-downtime deploy verification. Multi-tenancy. Auth. A
-frontend. Autoscaling. Terraform. A service mesh. A configurable rule engine.
+Multi-tenancy. Auth. A frontend. Autoscaling. Terraform. A service mesh. A
+configurable rule engine.
 
-The Kubernetes layer is the obvious next step and is **not** claimed as done —
-this is Docker Compose and says so. Adding a rolling-deploy probe that measures
-5xx and p99 across a release is the intended follow-up, because "zero-downtime"
-should be a number that updates on every deploy rather than an adjective.
+Kubernetes and rolling-deploy verification used to be on this list. They came
+off it by being built and measured, not by being claimed — see
+[Releases are measured](#releases-are-measured) for what the numbers cover and
+what they do not.
 
 ## Accuracy is not claimed
 
@@ -103,6 +160,9 @@ services/ingester   polls OSV (or a fixture), publishes to Redpanda
 services/processor  consumes, extracts, caches, persists, dead-letters
 services/api        NestJS read API — /health, /advisories, /check
 ops/fixture.json    offline advisories, including one with no versions at all
+ops/probe.mjs       the release probe — open-loop load, percentiles, exit code
+deploy/helm         the chart: three services, their dependencies, probes, PDB
+deploy/*.sh         k3d up, probe, down
 ```
 
 `npm test` runs the extractor and content-hash tests without Docker.

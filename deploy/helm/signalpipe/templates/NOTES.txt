@@ -1,0 +1,52 @@
+{{ .Chart.Name }} {{ .Chart.Version }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+  image        {{ include "signalpipe.image" . }}
+  api          {{ .Values.api.replicas }} replicas, maxUnavailable={{ .Values.api.strategy.maxUnavailable }} maxSurge={{ .Values.api.strategy.maxSurge }}
+  processor    {{ .Values.processor.replicas }} replicas, extractor={{ if .Values.processor.anthropicSecret }}claude (secret {{ .Values.processor.anthropicSecret }}){{ else }}heuristic (no API key){{ end }}
+  ingester     {{ .Values.ingester.replicas }} replica, source={{ if .Values.ingester.offlineFixture }}offline fixture{{ else }}live OSV API{{ end }}, poll={{ .Values.ingester.pollSeconds }}s
+  dependencies postgres={{ .Values.deps.postgres.enabled }} redis={{ .Values.deps.redis.enabled }} redpanda={{ .Values.deps.redpanda.enabled }}
+
+{{- if or .Values.deps.postgres.enabled .Values.deps.redpanda.enabled }}
+
+  NOTE: in-cluster dependencies are single replicas on emptyDir. They are for a
+  laptop cluster. Restarting one loses its data. Set deps.*.enabled=false and
+  external.* for anything you care about.
+{{- end }}
+
+1. Wait for the rollout:
+
+     kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "signalpipe.fullname" . }}-api --timeout=180s
+
+2. Ask it the question the pipeline exists to answer:
+
+{{- if .Values.api.ingress.enabled }}
+
+     # through the ingress (k3d maps host :8080 to the cluster loadbalancer)
+     curl -s localhost:8080/health
+{{- end }}
+
+     # or without an ingress
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "signalpipe.fullname" . }}-api 8080:{{ .Values.api.service.port }} &
+     curl -s localhost:8080/health
+     curl -s localhost:8080/check -H 'content-type: application/json' -d '{"dependencies":[
+       {"ecosystem":"npm","name":"lodash","version":"4.17.20"},
+       {"ecosystem":"npm","name":"minimist","version":"1.2.5"},
+       {"ecosystem":"npm","name":"tar","version":"6.2.0"}]}'
+
+   The ingester polls every {{ .Values.ingester.pollSeconds }}s, so /health may report
+   advisories: 0 for a few seconds after install.
+
+3. Measure a release. This is the part worth running — it fires steady traffic
+   at the API while a real rolling deploy runs underneath, and exits non-zero if
+   a single request failed:
+
+     ./deploy/probe.sh
+
+   It drives the deploy with `helm upgrade --set releaseId=<timestamp>`, which
+   changes the pod template and produces a genuine rolling replacement.
+
+4. Probe endpoints, if you want to see the split:
+
+     /live    liveness  — this process only, never its dependencies
+     /ready   readiness — Postgres reachable, and 503 the instant SIGTERM lands
+     /health  human-facing summary, wired to no probe

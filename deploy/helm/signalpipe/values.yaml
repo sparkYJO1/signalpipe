@@ -1,0 +1,113 @@
+# One image, three entrypoints — the same shape as the Dockerfile.
+image:
+  repository: signalpipe
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# Stamped onto every pod template as an annotation. Changing it is what makes
+# `helm upgrade` produce a genuine rolling replacement even when the image tag
+# is unchanged, which is exactly what the release probe needs to measure.
+releaseId: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+api:
+  replicas: 3
+  port: 3000
+
+  # maxUnavailable: 0 is the whole point. With 3 replicas and maxUnavailable: 1
+  # the Deployment is allowed to delete a pod before its replacement is ready,
+  # so a third of capacity can be missing mid-rollout. Paying for one surge pod
+  # is cheaper than explaining a latency spike. See ADR-0006.
+  strategy:
+    maxUnavailable: 0
+    maxSurge: 1
+
+  # Time between SIGTERM and the listening socket closing. Covers the window in
+  # which the pod is already gone from Endpoints but the ingress has not caught
+  # up yet.
+  drainSeconds: 5
+  # The kubelet runs preStop before SIGTERM, so this delays the signal while
+  # endpoint removal propagates. terminationGracePeriodSeconds is measured from
+  # the start of preStop, not from SIGTERM, so it must exceed both.
+  preStopSeconds: 5
+  terminationGracePeriodSeconds: 30
+
+  resources:
+    requests: { cpu: 50m, memory: 160Mi }
+    limits: { cpu: "1", memory: 384Mi }
+
+  service:
+    type: ClusterIP
+    port: 80
+
+  ingress:
+    enabled: true
+    className: traefik
+    # Empty host means "match any", which is what a k3d loadbalancer on
+    # localhost needs.
+    host: ""
+
+  pdb:
+    enabled: true
+    minAvailable: 2
+
+ingester:
+  replicas: 1
+  pollSeconds: 60
+  # Ship the offline fixture as a ConfigMap so a fresh cluster has data without
+  # reaching the network, the same way `docker compose up` does. The content
+  # comes from `--set-file fixtureJson=ops/fixture.json` rather than a second
+  # copy inside the chart.
+  offlineFixture: true
+  resources:
+    requests: { cpu: 25m, memory: 96Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+  terminationGracePeriodSeconds: 30
+
+processor:
+  replicas: 2
+  maxAttempts: 3
+  # Set to a Secret name holding key ANTHROPIC_API_KEY to swap the heuristic
+  # extractor for Claude. Empty means the deterministic extractor, no network.
+  anthropicSecret: ""
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: "1", memory: 384Mi }
+  terminationGracePeriodSeconds: 45
+
+# In-cluster dependencies. These are for a laptop cluster and are single
+# replicas on emptyDir: restarting one loses its data. In anything real these
+# are off and the URLs below point at a managed Postgres, a managed Redis and a
+# real Redpanda/Kafka cluster.
+deps:
+  postgres:
+    enabled: true
+    image: postgres:16-alpine
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { cpu: "1", memory: 512Mi }
+  redis:
+    enabled: true
+    image: redis:7-alpine
+    resources:
+      requests: { cpu: 25m, memory: 64Mi }
+      limits: { cpu: 500m, memory: 256Mi }
+  redpanda:
+    enabled: true
+    image: redpandadata/redpanda:v24.2.7
+    memory: 512M
+    resources:
+      requests: { cpu: 100m, memory: 640Mi }
+      limits: { cpu: "2", memory: 1200Mi }
+
+# Raw contents of ops/fixture.json, supplied with --set-file. Left empty here on
+# purpose: a default would be a duplicate of a file that already exists.
+fixtureJson: ""
+
+# Used when the matching deps.* entry is disabled.
+external:
+  databaseUrl: ""
+  redisUrl: ""
+  redpandaBrokers: ""

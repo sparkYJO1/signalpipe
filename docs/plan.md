@@ -79,3 +79,38 @@ Two things went differently than planned:
 Next, in order: a rolling-deploy probe that measures 5xx and p99 across a
 release, then Kubernetes and Helm underneath it, then extraction accuracy
 against a labelled set.
+
+## Follow-up, added after the fact
+
+The two items at the top of that list are done. The rolling-deploy probe is
+`ops/probe.mjs`, the Kubernetes layer under it is `deploy/helm/signalpipe`, and
+the plan's refusal to use "zero-downtime" now has a number attached to it
+instead of being a refusal: six rolling deploys, 10,449 requests at 40–50/s,
+zero failed. The probe runs in CI, so the claim expires if it stops being true.
+
+The ordering held up. Building the pipeline under Docker Compose first meant
+the Kubernetes work was about the deploy, which is the interesting part, rather
+than about getting one advisory to flow.
+
+Four things went differently than the plan assumed:
+
+- The configuration this document would have called obviously correct —
+  `maxUnavailable: 0` plus a readiness probe that fails on SIGTERM — dropped 49
+  of 1652 requests. Readiness is a request to stop sending; it is not an
+  acknowledgement that sending has stopped. ADR-0006.
+- The next attempt, a `preStop` sleep, reached zero failures with a p99 of 2.7
+  seconds. Counting failures alone would have declared that a success. The
+  latency columns are why the probe prints them.
+- `docker compose`'s `depends_on: condition: service_healthy` has no Kubernetes
+  equivalent, and the fix is not an initContainer. Running migrations before
+  opening the listening socket made every API pod fail its startup probe on a
+  cold cluster, because connection-refused is indistinguishable from a crash.
+  The port opens first now, and the wait is reported through readiness.
+- Having fixed that, the migration retry loop still carried its own 60-second
+  deadline, sitting next to a startup probe deliberately given 180 seconds. On a
+  cold cluster the shorter clock won silently and the pod restarted anyway.
+  Deciding when to give up on a slow dependency is the orchestrator's job.
+
+Still next, in order: extraction accuracy against a labelled set, then
+autoscaling with a signal that is not CPU — consumer lag is the honest one here,
+and it is the same argument as ADR-0002.

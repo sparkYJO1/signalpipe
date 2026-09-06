@@ -1,0 +1,122 @@
+# The number in the README has a mechanism.
+#
+# This builds the image, stands up a real k3d cluster, installs the chart, and
+# runs the release probe against a real `helm upgrade`. The probe exits non-zero
+# if a single request failed during the rollout, so a change that reintroduces
+# dropped requests fails the build instead of quietly ageing the README.
+name: release probe
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: release-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --no-audit --no-fund
+      - run: npm run build
+      - run: npm test
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - run: helm lint deploy/helm/signalpipe --set fixtureJson=placeholder
+      # Render with the dependencies switched off and no external URLs, and
+      # assert the chart refuses rather than installing something that will
+      # crash-loop against a hostname that does not exist.
+      - name: chart refuses a half-configured install
+        run: |
+          if helm template sp deploy/helm/signalpipe \
+              --set-file fixtureJson=ops/fixture.json \
+              --set deps.postgres.enabled=false >/dev/null 2>&1; then
+            echo "expected the render to fail without external.databaseUrl" >&2
+            exit 1
+          fi
+
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: install k3d
+        run: |
+          curl -sfL https://raw.githubusercontent.com/k3d-io/k3d/v5.7.4/install.sh \
+            | TAG=v5.7.4 bash
+          k3d version
+
+      - name: bring up the cluster and install the chart
+        run: ./deploy/k3d-up.sh
+
+      - name: show what is running
+        run: |
+          kubectl -n signalpipe get pods -o wide
+          curl -sS localhost:8080/health
+          echo
+
+      # Wait for the ingester's first poll so /check has data to look at and the
+      # probe is exercising a real query rather than an empty table.
+      - name: wait for advisories
+        run: |
+          for _ in $(seq 1 60); do
+            n=$(curl -s localhost:8080/health | sed -n 's/.*"advisories":\([0-9-]*\).*/\1/p')
+            [ "${n:-0}" -gt 0 ] && echo "advisories=$n" && exit 0
+            sleep 5
+          done
+          echo "no advisories after 5 minutes" >&2
+          exit 1
+
+      # The assertion. Non-zero exit if any request failed during the rollout.
+      - name: release probe
+        run: RPS=50 COOLDOWN=25 ./deploy/probe.sh --out probe-result.txt --json probe-result.json
+
+      - name: probe result
+        if: always()
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat probe-result.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "(no result)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n signalpipe get pods -o wide || true
+          kubectl -n signalpipe describe deploy signalpipe-api || true
+          kubectl -n signalpipe logs -l app.kubernetes.io/component=api --tail=100 --prefix || true
+          kubectl -n kube-system logs -l app.kubernetes.io/name=traefik --tail=100 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-result
+          path: |
+            probe-result.txt
+            probe-result.json
+          if-no-files-found: warn
+
+      - name: tear down
+        if: always()
+        run: ./deploy/k3d-down.sh || true

@@ -1,0 +1,159 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-api
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  # Never take capacity away to make room for the new version. maxSurge: 1
+  # means the rollout rents one extra pod instead of borrowing an existing one.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.api.strategy.maxUnavailable }}
+      maxSurge: {{ .Values.api.strategy.maxSurge }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "signalpipe.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "signalpipe.labels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+      {{- with include "signalpipe.podAnnotations" . | trim }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
+    spec:
+      # Must exceed preStop + drain + close. The clock starts when preStop
+      # starts, not when SIGTERM is delivered.
+      terminationGracePeriodSeconds: {{ .Values.api.terminationGracePeriodSeconds }}
+      # Spread replicas across nodes where there is more than one, so a node
+      # going away cannot take the whole API with it. ScheduleAnyway keeps a
+      # single-node laptop cluster schedulable.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "signalpipe.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: api
+      containers:
+        - name: api
+          image: {{ include "signalpipe.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["node", "services/api/dist/main.js"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.api.port | quote }}
+            - name: DATABASE_URL
+              value: {{ include "signalpipe.databaseUrl" . | quote }}
+            - name: REDIS_URL
+              value: {{ include "signalpipe.redisUrl" . | quote }}
+            - name: SHUTDOWN_DRAIN_MS
+              value: {{ mul .Values.api.drainSeconds 1000 | quote }}
+          lifecycle:
+            preStop:
+              exec:
+                # Delay SIGTERM while endpoint removal propagates to kube-proxy
+                # and the ingress. The pod keeps serving normally throughout;
+                # it has already been struck from the Endpoints list by the time
+                # this runs. Removing this sleep is what produced the dropped
+                # requests recorded in ADR-0006.
+                command: ["/bin/sh", "-c", "sleep {{ .Values.api.preStopSeconds }}"]
+          # Boot waits on Postgres, so give it its own budget rather than
+          # inflating liveness initialDelaySeconds. 2s x 90 = 3 minutes, which
+          # is generous on purpose: a cold laptop cluster starting Postgres,
+          # Redis and Redpanda at once is slower than any real cluster, and a
+          # startup budget that is too tight kills healthy pods (see ADR-0006).
+          startupProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 2
+            failureThreshold: 90
+          # /live touches this process only. If it checked Postgres, a database
+          # blip would fail liveness on every replica at once and the kubelet
+          # would restart all of them.
+          livenessProbe:
+            httpGet: { path: /live, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # /ready checks Postgres and returns 503 the moment SIGTERM lands.
+          # Short period because this number is the endpoint-removal latency the
+          # probe measures.
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 2
+            successThreshold: 1
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-api
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  type: {{ .Values.api.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.api.service.port }}
+      targetPort: http
+  selector:
+    app.kubernetes.io/name: {{ include "signalpipe.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: api
+{{- if .Values.api.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-api
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+spec:
+  # Guards voluntary disruption only — a node drain, not a Deployment rollout.
+  # The rollout is governed by maxUnavailable above; these are two different
+  # controllers and confusing them is a common way to think you are protected.
+  minAvailable: {{ .Values.api.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "signalpipe.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+{{- end }}
+{{- if .Values.api.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-api
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.api.ingress.className }}
+  rules:
+    - {{ if .Values.api.ingress.host }}host: {{ .Values.api.ingress.host | quote }}
+      {{ end }}http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "signalpipe.fullname" . }}-api
+                port:
+                  number: {{ .Values.api.service.port }}
+{{- end }}

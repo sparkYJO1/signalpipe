@@ -1,0 +1,164 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-ingester
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingester
+spec:
+  replicas: {{ .Values.ingester.replicas }}
+  # A worker serves no traffic, so surging costs a duplicate poll for nothing.
+  # Recreate keeps exactly one publisher alive at a time.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "signalpipe.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: ingester
+  template:
+    metadata:
+      labels:
+        {{- include "signalpipe.labels" . | nindent 8 }}
+        app.kubernetes.io/component: ingester
+      {{- with include "signalpipe.podAnnotations" . | trim }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.ingester.terminationGracePeriodSeconds }}
+      {{- if .Values.ingester.offlineFixture }}
+      volumes:
+        - name: fixture
+          configMap:
+            name: {{ include "signalpipe.fullname" . }}-fixture
+      {{- end }}
+      containers:
+        - name: ingester
+          image: {{ include "signalpipe.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["node", "services/ingester/dist/main.js"]
+          env:
+            - name: REDPANDA_BROKERS
+              value: {{ include "signalpipe.brokers" . | quote }}
+            - name: POLL_SECONDS
+              value: {{ .Values.ingester.pollSeconds | quote }}
+            {{- if .Values.ingester.offlineFixture }}
+            - name: OFFLINE_FIXTURE
+              value: /fixture/fixture.json
+            {{- end }}
+          {{- if .Values.ingester.offlineFixture }}
+          volumeMounts:
+            - name: fixture
+              mountPath: /fixture
+              readOnly: true
+          {{- end }}
+          # The poll loop rewrites the heartbeat at the top of every tick, so a
+          # stalled timer or a wedged event loop goes stale. maxAge is three
+          # poll intervals: one missed tick is noise, three is a stuck process.
+          livenessProbe:
+            {{- include "signalpipe.heartbeatProbe" (dict "file" "/tmp/health/live" "maxAge" (mul .Values.ingester.pollSeconds 3)) | nindent 12 }}
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            {{- include "signalpipe.heartbeatProbe" (dict "file" "/tmp/health/ready" "maxAge" 86400) | nindent 12 }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.ingester.resources | nindent 12 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-processor
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: processor
+spec:
+  replicas: {{ .Values.processor.replicas }}
+  # Surge would add a consumer to the group and trigger an extra rebalance on
+  # the way in as well as on the way out. Taking one down first is the cheaper
+  # of the two, because the work is queued and lag is the backpressure signal
+  # this pipeline is designed around (ADR-0002).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "signalpipe.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: processor
+  template:
+    metadata:
+      labels:
+        {{- include "signalpipe.labels" . | nindent 8 }}
+        app.kubernetes.io/component: processor
+      {{- with include "signalpipe.podAnnotations" . | trim }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
+    spec:
+      # Longer than the API's, because a shutdown here waits for the in-flight
+      # extraction to finish. An extraction that is killed mid-call is not lost
+      # — the message is re-delivered and the content-hash cache makes the
+      # retry free (ADR-0001) — but paying for it twice is avoidable.
+      terminationGracePeriodSeconds: {{ .Values.processor.terminationGracePeriodSeconds }}
+      containers:
+        - name: processor
+          image: {{ include "signalpipe.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["node", "services/processor/dist/main.js"]
+          env:
+            - name: REDPANDA_BROKERS
+              value: {{ include "signalpipe.brokers" . | quote }}
+            - name: DATABASE_URL
+              value: {{ include "signalpipe.databaseUrl" . | quote }}
+            - name: REDIS_URL
+              value: {{ include "signalpipe.redisUrl" . | quote }}
+            - name: MAX_ATTEMPTS
+              value: {{ .Values.processor.maxAttempts | quote }}
+            {{- if .Values.processor.anthropicSecret }}
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.processor.anthropicSecret }}
+                  key: ANTHROPIC_API_KEY
+            {{- end }}
+          # Liveness is "still fetching from the broker". The heartbeat is
+          # rewritten on every kafkajs FETCH, including empty ones, so an idle
+          # consumer stays live and one stuck in a rebalance loop does not.
+          livenessProbe:
+            {{- include "signalpipe.heartbeatProbe" (dict "file" "/tmp/health/live" "maxAge" 90) | nindent 12 }}
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 3
+          # Ready once the consumer has joined the group. This is what makes a
+          # processor rollout wait for the rebalance instead of racing through
+          # it and leaving no consumer attached to a partition.
+          readinessProbe:
+            {{- include "signalpipe.heartbeatProbe" (dict "file" "/tmp/health/ready" "maxAge" 86400) | nindent 12 }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.processor.resources | nindent 12 }}
+{{- if .Values.ingester.offlineFixture }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-fixture
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+data:
+  # Not vendored into the chart. There is one fixture in this repo, at
+  # ops/fixture.json, and the deploy script passes it with
+  #   --set-file fixtureJson=ops/fixture.json
+  # so the chart cannot drift from the copy Docker Compose mounts.
+  fixture.json: |
+{{ required "ingester.offlineFixture is on, so --set-file fixtureJson=ops/fixture.json is required" .Values.fixtureJson | indent 4 }}
+{{- end }}

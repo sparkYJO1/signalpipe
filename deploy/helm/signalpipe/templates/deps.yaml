@@ -1,0 +1,226 @@
+{{/*
+Laptop-only dependencies.
+
+Single replicas on emptyDir. Restarting one loses its data, and that is stated
+rather than papered over with a PVC that would still not make this production
+storage. In a real cluster all three of these are `enabled: false` and
+external.* points at managed services.
+*/}}
+{{- if .Values.deps.postgres.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-postgres
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        {{- include "signalpipe.labels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres
+    spec:
+      volumes:
+        - name: data
+          emptyDir: {}
+      containers:
+        - name: postgres
+          image: {{ .Values.deps.postgres.image }}
+          env:
+            - name: POSTGRES_PASSWORD
+              value: postgres
+            - name: POSTGRES_DB
+              value: signalpipe
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: pg
+              containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "signalpipe"]
+            periodSeconds: 3
+            failureThreshold: 20
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 4
+          resources:
+            {{- toYaml .Values.deps.postgres.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-postgres
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+spec:
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: postgres
+{{- end }}
+{{- if .Values.deps.redis.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-redis
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+        {{- include "signalpipe.labels" . | nindent 8 }}
+        app.kubernetes.io/component: redis
+    spec:
+      containers:
+        - name: redis
+          image: {{ .Values.deps.redis.image }}
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 3
+            failureThreshold: 20
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 4
+          resources:
+            {{- toYaml .Values.deps.redis.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-redis
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+spec:
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: redis
+{{- end }}
+{{- if .Values.deps.redpanda.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-redpanda
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redpanda
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: redpanda
+  template:
+    metadata:
+      labels:
+        {{- include "signalpipe.labels" . | nindent 8 }}
+        app.kubernetes.io/component: redpanda
+    spec:
+      volumes:
+        - name: data
+          emptyDir: {}
+      containers:
+        - name: redpanda
+          image: {{ .Values.deps.redpanda.image }}
+          # `args`, not `command`. The image entrypoint is a shell script that
+          # execs `rpk "$@"`, and `command` in Kubernetes replaces ENTRYPOINT —
+          # so `command: [redpanda, start, ...]` invokes the broker binary
+          # directly, which does not understand rpk's flags and dies with
+          # "unrecognised option '--check=false'".
+          #
+          # The advertised address has to be the in-cluster Service DNS name.
+          # Advertise the pod IP or localhost and every client resolves a
+          # broker it cannot reach, which looks like a hang rather than an error.
+          args:
+            - redpanda
+            - start
+            - --overprovisioned
+            - --smp=1
+            - --memory={{ .Values.deps.redpanda.memory }}
+            - --reserve-memory=0M
+            - --node-id=0
+            - --check=false
+            - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+            - --advertise-kafka-addr=PLAINTEXT://{{ include "signalpipe.fullname" . }}-redpanda:9092
+          ports:
+            - name: kafka
+              containerPort: 9092
+            - name: admin
+              containerPort: 9644
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/redpanda/data
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "rpk cluster health | grep -q 'Healthy:.*true'"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket:
+              port: kafka
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 4
+          resources:
+            {{- toYaml .Values.deps.redpanda.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "signalpipe.fullname" . }}-redpanda
+  labels:
+    {{- include "signalpipe.labels" . | nindent 4 }}
+spec:
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+    - name: admin
+      port: 9644
+      targetPort: admin
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: redpanda
+{{- end }}

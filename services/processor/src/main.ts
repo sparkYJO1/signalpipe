@@ -3,7 +3,11 @@ import {
   TOPIC_DLQ,
   connectConsumer,
   connectProducer,
-  migrate,
+  closeAll,
+  beat,
+  LIVE_FILE,
+  READY_FILE,
+  migrateWithRetry,
   pool,
   redis,
   type Extraction,
@@ -86,10 +90,25 @@ async function persist(
 }
 
 async function main(): Promise<void> {
-  await migrate();
+  // Beat before anything that can block. Connecting to the broker on a cold
+  // cluster can take longer than the liveness threshold, and a process that is
+  // patiently retrying is not a process that needs killing.
+  beat(LIVE_FILE);
+  await migrateWithRetry();
   const consumer = await connectConsumer("processor", "processor-v1");
   const dlq = await connectProducer("processor-dlq");
   await consumer.subscribe({ topic: TOPIC_ADVISORIES, fromBeginning: true });
+
+  // Liveness is "still fetching from the broker", not "process exists". FETCH
+  // fires on every fetch cycle including empty ones, so an idle consumer still
+  // beats, while one wedged in a rebalance loop or holding a dead broker
+  // connection goes quiet — which is the failure worth restarting for.
+  beat(LIVE_FILE);
+  consumer.on(consumer.events.FETCH, () => beat(LIVE_FILE));
+  consumer.on(consumer.events.GROUP_JOIN, () => {
+    beat(LIVE_FILE);
+    beat(READY_FILE);
+  });
 
   let done = 0;
   let hits = 0;
@@ -97,6 +116,24 @@ async function main(): Promise<void> {
   console.log(
     `[processor] extractor=${extractor.id} maxAttempts=${MAX_ATTEMPTS}`,
   );
+
+  // SIGTERM stops the runner and waits for the in-flight handler. A message
+  // that was mid-extraction when the pod went away is re-delivered to whoever
+  // picks up the partition, which is safe precisely because of the content-hash
+  // cache in ADR-0001 — the redelivery is a cache hit, not a second API call.
+  let stopping = false;
+  const shutdown = async (signal: string) => {
+    if (stopping) return;
+    stopping = true;
+    console.log(`[processor] ${signal}: disconnecting`);
+    setTimeout(() => process.exit(0), 25_000).unref();
+    await consumer.disconnect().catch(() => undefined);
+    await dlq.disconnect().catch(() => undefined);
+    await closeAll();
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
 
   await consumer.run({
     // One message at a time. The extractor is the bottleneck, so there is

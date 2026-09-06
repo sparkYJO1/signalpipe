@@ -1,0 +1,7 @@
+apiVersion: v2
+name: signalpipe
+description: An ingest pipeline with a slow, expensive, non-deterministic consumer in the middle of it
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/sparkYJO1/signalpipe

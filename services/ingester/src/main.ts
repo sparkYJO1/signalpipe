@@ -1,5 +1,8 @@
 import {
+  LIVE_FILE,
+  READY_FILE,
   TOPIC_ADVISORIES,
+  beat,
   connectProducer,
   contentHash,
   partitionKey,
@@ -62,6 +65,10 @@ function toRaw(
 }
 
 async function main(): Promise<void> {
+  // Beat before anything that can block. Connecting to the broker on a cold
+  // cluster can take longer than the liveness threshold, and a process that is
+  // patiently retrying is not a process that needs killing.
+  beat(LIVE_FILE);
   const producer = await connectProducer("ingester");
   console.log(
     `[ingester] mode=${OFFLINE_FIXTURE ? "fixture" : "osv"} poll=${POLL_SECONDS}s packages=${PACKAGES.length}`,
@@ -81,6 +88,10 @@ async function main(): Promise<void> {
   };
 
   const tick = async () => {
+    // Beat first, then work. The heartbeat asserts "the poll loop is running",
+    // and OSV being unreachable is not a reason to restart this pod — the catch
+    // below already makes a failed poll non-fatal.
+    beat(LIVE_FILE);
     try {
       if (OFFLINE_FIXTURE) {
         const groups = await fetchFixture();
@@ -105,11 +116,21 @@ async function main(): Promise<void> {
     }
   };
 
+  beat(READY_FILE);
   await tick();
   // The ingester does not throttle itself when the processor falls behind.
   // Consumer lag is the backpressure signal, and it is deliberately allowed to
   // grow rather than being hidden by slowing the producer. See ADR-0002.
-  setInterval(tick, POLL_SECONDS * 1000);
+  const timer = setInterval(tick, POLL_SECONDS * 1000);
+
+  const shutdown = async (signal: string) => {
+    console.log(`[ingester] ${signal}: disconnecting`);
+    clearInterval(timer);
+    await producer.disconnect().catch(() => undefined);
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
 }
 
 main().catch((err) => {
